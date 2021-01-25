@@ -33,6 +33,8 @@
 
 from threading import Lock
 
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy
+
 from rosbridge_library.internal import ros_loader
 from rosbridge_library.internal.message_conversion import msg_class_type_repr
 from rosbridge_library.internal.topics import TopicNotEstablishedException
@@ -105,7 +107,8 @@ class MultiSubscriber():
         self.msg_class = msg_class
         self.node_handle = node_handle
         # TODO(@jubeira): add support for other QoS.
-        self.subscriber = node_handle.create_subscription(msg_class, topic, self.callback, 10)
+        qos_profile = QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT)
+        self.subscriber = node_handle.create_subscription(msg_class, topic, self.callback, qos_profile)
         self.new_subscriber = None
         self.new_subscriptions = {}
 
@@ -147,8 +150,9 @@ class MultiSubscriber():
             # which adds the new callback to the subscriptions dictionary.
             self.new_subscriptions.update({client_id: callback})
             if self.new_subscriber is None:
+                qos_profile = QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT)
                 self.new_subscriber = self.node_handle.create_subscription(
-                    self.msg_class, self.topic, self._new_sub_callback, 10)
+                    self.msg_class, self.topic, self._new_sub_callback, qos_profile)
 
     def unsubscribe(self, client_id):
         """ Unsubscribe the specified client from this subscriber
