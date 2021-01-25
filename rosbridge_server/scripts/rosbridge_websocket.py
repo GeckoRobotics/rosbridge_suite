@@ -38,10 +38,16 @@ import time
 
 from socket import error
 
-from threading import Thread
-from tornado.ioloop import IOLoop
-from tornado.ioloop import PeriodicCallback
-from tornado.web import Application
+from twisted.python import log
+from twisted.internet import reactor, ssl, task
+from twisted.internet.error import CannotListenError, ReactorNotRunning
+from distutils.version import LooseVersion
+import autobahn # to check version
+from autobahn.twisted.websocket import WebSocketServerFactory, listenWS
+from autobahn.websocket.compress import (PerMessageDeflateOffer,
+                                         PerMessageDeflateOfferAccept)
+
+log.startLogging(sys.stdout)
 
 import rclpy
 from rclpy.node import Node
@@ -49,7 +55,8 @@ from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy
 from std_msgs.msg import Int32
 
-from rosbridge_server import RosbridgeWebSocket, ClientManager
+from rosbridge_server import ClientManager
+from rosbridge_server.autobahn_websocket import RosbridgeWebSocket
 
 from rosbridge_library.capabilities.advertise import Advertise
 from rosbridge_library.capabilities.publish import Publish
@@ -58,11 +65,12 @@ from rosbridge_library.capabilities.advertise_service import AdvertiseService
 from rosbridge_library.capabilities.unadvertise_service import UnadvertiseService
 from rosbridge_library.capabilities.call_service import CallService
 
-def start_hook():
-    IOLoop.instance().start()
 
 def shutdown_hook():
-    IOLoop.instance().stop()
+    try:
+        reactor.stop()
+    except ReactorNotRunning:
+        print("Can't stop the reactor, it wasn't running")
 
 
 class RosbridgeWebsocketNode(Node):
@@ -76,8 +84,7 @@ class RosbridgeWebsocketNode(Node):
         ##################################################
         retry_startup_delay = self.declare_parameter('retry_startup_delay', 2.0).value  # seconds.
 
-        RosbridgeWebSocket.use_compression = self.declare_parameter(
-            'use_compression', False).value
+        use_compression = self.declare_parameter('use_compression', False).value
 
         # get RosbridgeProtocol parameters
         RosbridgeWebSocket.fragment_timeout = self.declare_parameter(
@@ -97,10 +104,9 @@ class RosbridgeWebsocketNode(Node):
         if RosbridgeWebSocket.max_message_size == "None":
             RosbridgeWebSocket.max_message_size = None
 
-        # get tornado application parameters
-        tornado_settings = {}
-        tornado_settings['websocket_ping_interval'] = float(self.declare_parameter('websocket_ping_interval', 0).value)
-        tornado_settings['websocket_ping_timeout'] = float(self.declare_parameter('websocket_ping_timeout', 30).value)
+        ping_interval = float(self.declare_parameter('websocket_ping_interval', 0).value)
+        ping_timeout = float(self.declare_parameter('websocket_ping_timeout', 30).value)
+        null_origin = self.declare_parameter('websocket_null_origin', True).value #default to original behaviour
 
         # SSL options
         certfile = self.declare_parameter('certfile').value
@@ -111,6 +117,13 @@ class RosbridgeWebsocketNode(Node):
         port = self.declare_parameter('port', 9090).value
 
         address = self.declare_parameter('address', '').value
+
+        external_port = self.declare_parameter('websocket_external_port', None).value
+        if external_port:
+            try:
+                external_port = int(external_port)
+            except ValueError:
+                external_port = None
 
         RosbridgeWebSocket.client_manager = ClientManager(self)
 
@@ -247,7 +260,7 @@ class RosbridgeWebsocketNode(Node):
         if "--websocket_ping_interval" in sys.argv:
             idx = sys.argv.index("--websocket_ping_interval") + 1
             if idx < len(sys.argv):
-                tornado_settings['websocket_ping_interval'] = float(sys.argv[idx])
+                ping_interval = float(sys.argv[idx])
             else:
                 print("--websocket_ping_interval argument provided without a value.")
                 sys.exit(-1)
@@ -255,9 +268,17 @@ class RosbridgeWebsocketNode(Node):
         if "--websocket_ping_timeout" in sys.argv:
             idx = sys.argv.index("--websocket_ping_timeout") + 1
             if idx < len(sys.argv):
-                tornado_settings['websocket_ping_timeout'] = float(sys.argv[idx])
+                ping_timeout = float(sys.argv[idx])
             else:
                 print("--websocket_ping_timeout argument provided without a value.")
+                sys.exit(-1)
+
+        if "--websocket_external_port" in sys.argv:
+            idx = sys.argv.index("--websocket_external_port") + 1
+            if idx < len(sys.argv):
+                external_port = int(sys.argv[idx])
+            else:
+                print("--websocket_external_port argument provided without a value.")
                 sys.exit(-1)
 
         # To be able to access the list of topics and services, you must be able to access the rosapi services.
@@ -271,22 +292,54 @@ class RosbridgeWebsocketNode(Node):
         UnadvertiseService.services_glob = RosbridgeWebSocket.services_glob
         CallService.services_glob = RosbridgeWebSocket.services_glob
 
+        # Support the legacy "" address value.
+        # The socket library would interpret this as INADDR_ANY.
+        if not address:
+            address = '0.0.0.0'
+
         ##################################################
         # Done with parameter handling                   #
         ##################################################
 
-        application = Application([(r"/", RosbridgeWebSocket), (r"", RosbridgeWebSocket)], **tornado_settings)
+        def handle_compression_offers(offers):
+            if not use_compression:
+                return
+            for offer in offers:
+                if isinstance(offer, PerMessageDeflateOffer):
+                    return PerMessageDeflateOfferAccept(offer)
+
+        if certfile is not None and keyfile is not None:
+            protocol = 'wss'
+            context_factory = ssl.DefaultOpenSSLContextFactory(keyfile, certfile)
+        else:
+            protocol = 'ws'
+            context_factory = None
+
+        uri = '{}://{}:{}'.format(protocol, address, port)
+        factory = WebSocketServerFactory(uri, externalPort=external_port)
+        factory.protocol = RosbridgeWebSocket
+        # https://github.com/crossbario/autobahn-python/commit/2ef13a6804054de74eb36455b58a64a3c701f889
+        if LooseVersion(autobahn.__version__) < LooseVersion("0.15.0"):
+            factory.setProtocolOptions(
+                perMessageCompressionAccept=handle_compression_offers,
+                autoPingInterval=ping_interval,
+                autoPingTimeout=ping_timeout,
+            )
+        else:
+            factory.setProtocolOptions(
+                perMessageCompressionAccept=handle_compression_offers,
+                autoPingInterval=ping_interval,
+                autoPingTimeout=ping_timeout,
+                allowNullOrigin=null_origin,
+            )
 
         connected = False
         while not connected and self.context.ok():
             try:
-                if certfile is not None and keyfile is not None:
-                    application.listen(port, address, ssl_options={ "certfile": certfile, "keyfile": keyfile})
-                else:
-                    application.listen(port, address)
+                listenWS(factory, context_factory)
                 self.get_logger().info("Rosbridge WebSocket server started on port {}".format(port))
                 connected = True
-            except error as e:
+            except CannotListenError as e:
                 self.get_logger().warn(
                     "Unable to start server: {} "
                     "Retrying in {}s.".format(e, retry_startup_delay))
@@ -299,11 +352,11 @@ def main(args=None):
     rclpy.init(args=args)
     rosbridge_websocket_node = RosbridgeWebsocketNode()
 
-    spin_callback = PeriodicCallback(lambda: rclpy.spin_once(rosbridge_websocket_node, timeout_sec=0.01), 1)
-    spin_callback.start()
-    start_hook()
+    spin_callback = task.LoopingCall(lambda: rclpy.spin_once(rosbridge_websocket_node, timeout_sec=0.01))
+    spin_callback.start(0.001)
+    reactor.run()
 
-    node.destroy_node()
+    rosbridge_websocket_node.destroy_node()
     rclpy.shutdown()
     shutdown_hook()  # shutdown hook to stop the server
 

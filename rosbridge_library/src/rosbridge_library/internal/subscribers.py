@@ -194,7 +194,6 @@ class MultiSubscriber():
             except Exception as exc:
                 # Do nothing if one particular callback fails except log it
                 self.node_handle.get_logger().error("Exception calling subscribe callback: {}".format(exc))
-                pass
 
     def _new_sub_callback(self, msg):
         """
