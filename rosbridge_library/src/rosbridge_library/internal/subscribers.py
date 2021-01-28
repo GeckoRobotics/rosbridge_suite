@@ -208,7 +208,7 @@ class MultiSubscriber():
         subscriptors.
         """
         with self.lock:
-            self.callback(msg, [self.new_subscriptions.values()])
+            self.callback(msg, list(self.new_subscriptions.values()))
             self.subscriptions.update(self.new_subscriptions)
             self.new_subscriptions = {}
             self.node_handle.destroy_subscription(self.new_subscriber)
@@ -221,6 +221,7 @@ class SubscriberManager():
     """
 
     def __init__(self):
+        self._lock = Lock()
         self._subscribers = {}
 
     def subscribe(self, client_id, topic, callback, node_handle, msg_type=None):
@@ -233,14 +234,15 @@ class SubscriberManager():
         msg_type  -- (optional) the type of the topic
 
         """
-        if not topic in self._subscribers:
-            self._subscribers[topic] = MultiSubscriber(
-                topic, client_id, callback, node_handle, msg_type=msg_type)
-        else:
-            self._subscribers[topic].subscribe(client_id, callback)
+        with self._lock:
+            if not topic in self._subscribers:
+                self._subscribers[topic] = MultiSubscriber(
+                    topic, client_id, callback, node_handle, msg_type=msg_type)
+            else:
+                self._subscribers[topic].subscribe(client_id, callback)
 
-        if msg_type is not None:
-            self._subscribers[topic].verify_type(msg_type)
+            if msg_type is not None:
+                self._subscribers[topic].verify_type(msg_type)
 
     def unsubscribe(self, client_id, topic):
         """ Unsubscribe from a topic
@@ -250,14 +252,15 @@ class SubscriberManager():
         topic     -- the topic to unsubscribe from
 
         """
-        if not topic in self._subscribers:
-            return
+        with self._lock:
+            if not topic in self._subscribers:
+                return
 
-        self._subscribers[topic].unsubscribe(client_id)
+            self._subscribers[topic].unsubscribe(client_id)
 
-        if not self._subscribers[topic].has_subscribers():
-            self._subscribers[topic].unregister()
-            del self._subscribers[topic]
+            if not self._subscribers[topic].has_subscribers():
+                self._subscribers[topic].unregister()
+                del self._subscribers[topic]
 
 
 manager = SubscriberManager()
